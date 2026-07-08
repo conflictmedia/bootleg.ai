@@ -364,6 +364,8 @@ class ArenaAgent(
         augment_prompt: bool = True,
         auto_filename: bool = True,
         system_prompts: Optional[List[str]] = None,
+        incremental_write: bool = False,
+        conflict_resolution: str = "overwrite",
     ) -> Optional[str]:
         """Send `prompt` and return the assistant's response text.
 
@@ -409,6 +411,13 @@ class ArenaAgent(
         # This dramatically improves the hit rate of --write-files because
         # artifact cards carry filenames natively. Augmentation now always
         # applies to ensure every file gets a filename.
+        self.incremental_write = incremental_write
+        self.conflict_resolution = conflict_resolution
+        self.auto_filename = auto_filename
+        self.write_files = write_files
+        self._incremental_write_cache = {}
+        self._first_write_checks = set()
+
         effective_prompt = self._build_final_prompt(
             prompt,
             system_prompts=system_prompts,
@@ -729,6 +738,8 @@ class ArenaAgent(
 
             if response_started and code_blocks:
                 last_code_blocks = code_blocks
+                if self.incremental_write and self.write_files:
+                    self._incremental_write_files(code_blocks, self.write_files)
 
             # Update the generation latch. We consider generation "active" if
             # EITHER the isGenerating probe returns True OR the send button is

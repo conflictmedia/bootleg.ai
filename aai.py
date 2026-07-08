@@ -1628,6 +1628,8 @@ class ArenaAgent:
         augment_prompt: bool = True,
         auto_filename: bool = True,
         system_prompts: Optional[List[str]] = None,
+        incremental_write: bool = False,
+        conflict_resolution: str = "overwrite",
     ) -> Optional[str]:
         """Send `prompt` and return the assistant's response text.
 
@@ -1673,6 +1675,13 @@ class ArenaAgent:
         # This dramatically improves the hit rate of --write-files because
         # artifact cards carry filenames natively. Augmentation now always
         # applies to ensure every file gets a filename.
+        self.incremental_write = incremental_write
+        self.conflict_resolution = conflict_resolution
+        self.auto_filename = auto_filename
+        self.write_files = write_files
+        self._incremental_write_cache = {}
+        self._first_write_checks = set()
+
         effective_prompt = self._build_final_prompt(
             prompt,
             system_prompts=system_prompts,
@@ -1993,6 +2002,8 @@ class ArenaAgent:
 
             if response_started and code_blocks:
                 last_code_blocks = code_blocks
+                if self.incremental_write and self.write_files:
+                    self._incremental_write_files(code_blocks, self.write_files)
 
             # Update the generation latch. We consider generation "active" if
             # EITHER the isGenerating probe returns True OR the send button is
@@ -2326,11 +2337,15 @@ class ArenaAgent:
 
             # Write files if requested (regardless of code_only stdout output).
             if write_files is not None:
-                self._write_code_files(
-                    blocks_for_writing,
-                    target_dir=write_files,
-                    dry_run=dry_run,
-                )
+                if getattr(self, "incremental_write", False):
+                    # Final flush of all blocks
+                    self._incremental_write_files(code_blocks, write_files)
+                else:
+                    self._write_code_files(
+                        blocks_for_writing,
+                        target_dir=write_files,
+                        dry_run=dry_run,
+                    )
 
             if code_only:
                 return formatted
@@ -2837,6 +2852,90 @@ class ArenaAgent:
             file=sys.stderr,
         )
         return results
+
+    def _write_single_file(self, target_dir, filename, code, auto_tag=""):
+        """Write a single file with conflict resolution constraints."""
+        out_path = Path(target_dir) / filename
+
+        # Only run conflict resolution check ONCE per file per run to avoid
+        # interrupting incremental stream writes
+        if filename not in self._first_write_checks:
+            self._first_write_checks.add(filename)
+
+            if out_path.exists():
+                strategy = getattr(self, "conflict_resolution", "overwrite")
+                if strategy == "skip":
+                    print(f"[warn] File {out_path} already exists. Skipping write as requested.", file=sys.stderr)
+                    return False
+
+                elif strategy == "backup":
+                    import datetime
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    backup_name = f"{out_path.name}.bak.{timestamp}"
+                    backup_path = out_path.parent / backup_name
+                    try:
+                        out_path.rename(backup_path)
+                        print(f"[info] Backed up existing file: {out_path.name} -> {backup_name}", file=sys.stderr)
+                    except Exception as e:
+                        print(f"[error] Failed to create backup of {out_path.name}: {e}", file=sys.stderr)
+
+                elif strategy == "suffix":
+                    base, ext = os.path.splitext(filename)
+                    counter = 1
+                    new_filename = f"{base}_{counter}{ext}"
+                    while (Path(target_dir) / new_filename).exists():
+                        counter += 1
+                        new_filename = f"{base}_{counter}{ext}"
+                    # Update out_path and rewrite the assigned filename in our checks
+                    out_path = Path(target_dir) / new_filename
+                    print(f"[info] Target file {filename} exists. Writing to {new_filename} instead.", file=sys.stderr)
+                    filename = new_filename
+                    self._first_write_checks.add(filename)
+
+        # Write/Update the file content
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(code)
+                if not code.endswith("\n"):
+                    f.write("\n")
+            print(f"[info] wrote {out_path} ({len(code)} chars){auto_tag}", file=sys.stderr)
+            return True
+        except Exception as e:
+            print(f"[error] Failed to write {out_path}: {e}", file=sys.stderr)
+            return False
+
+    def _incremental_write_files(self, code_blocks: List[Dict[str, Any]], target_dir_str: str):
+        """Processes and streams active code blocks to disk in real-time."""
+        if not code_blocks or not target_dir_str:
+            return
+
+        target_dir = Path(target_dir_str).expanduser().resolve()
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # Map and assign safe filenames using existing Mixin rules
+        blocks_for_writing = self._assign_filenames(code_blocks, auto_filename=getattr(self, "auto_filename", True))
+
+        for i, block in enumerate(blocks_for_writing):
+            raw_filename = (block.get("filename") or "").strip()
+            code = block.get("code") or ""
+
+            if not raw_filename or not self._is_writable_filename(raw_filename):
+                continue
+
+            safe_name = self._sanitize_filename(raw_filename)
+            if not safe_name:
+                continue
+
+            # Check if content has changed/grown since the last incremental write
+            content_len = len(code)
+            last_len = self._incremental_write_cache.get(safe_name, -1)
+
+            if content_len > last_len:
+                # Content has grown/changed! Write it to disk
+                auto_tag = " [auto-filename]" if block.get("auto_filename") else ""
+                success = self._write_single_file(target_dir, safe_name, code, auto_tag=auto_tag)
+                if success:
+                    self._incremental_write_cache[safe_name] = content_len
 
     def _dump_dom(self, path: Optional[str]) -> Optional[str]:
         """Dump diagnostic info about the last assistant bubble to a file.
@@ -3360,6 +3459,27 @@ def main():
             "divs and plain <pre> blocks will be skipped."
         ),
     )
+    parser.add_argument(
+        "--auto-write", "-a",
+        action="store_true",
+        help="Automatically write generated files to disk."
+    )
+    parser.add_argument(
+        "--auto-write-dir",
+        default="./out",
+        help="Default directory for automatic file writing (default: ./out)."
+    )
+    parser.add_argument(
+        "--incremental", "-i",
+        action="store_true",
+        help="Write files incrementally in real-time as they are streamed."
+    )
+    parser.add_argument(
+        "--conflict",
+        choices=["overwrite", "backup", "suffix", "skip"],
+        default="overwrite",
+        help="Collision handling strategy for existing local files (default: overwrite)."
+    )
     args = parser.parse_args()
 
     try:
@@ -3370,6 +3490,11 @@ def main():
         )
     except Exception as exc:
         parser.error(str(exc))
+
+    # Resolve write files destination if auto-write is specified
+    write_files_dir = args.write_files
+    if args.auto_write and not write_files_dir:
+        write_files_dir = args.auto_write_dir
 
     agent = ArenaAgent(
         site_key=args.site,
@@ -3395,12 +3520,14 @@ def main():
             code_only=args.code_only,
             debug_dom=args.debug_dom is not None,
             debug_dom_path=args.debug_dom,
-            write_files=args.write_files,
+            write_files=write_files_dir,
             dry_run=args.dry_run,
             augment_prompt=not args.no_prompt_augment,
             auto_filename=not args.no_auto_filename,
             activity_timeout_seconds=args.activity_timeout,
             system_prompts=args.system_prompts,
+            incremental_write=args.incremental,
+            conflict_resolution=args.conflict,
         )
         if response:
             if args.code_only:

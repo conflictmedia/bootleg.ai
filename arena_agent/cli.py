@@ -265,6 +265,27 @@ def main():
             "divs and plain <pre> blocks will be skipped."
         ),
     )
+    parser.add_argument(
+        "--auto-write", "-a",
+        action="store_true",
+        help="Automatically write generated files to disk."
+    )
+    parser.add_argument(
+        "--auto-write-dir",
+        default="./out",
+        help="Default directory for automatic file writing (default: ./out)."
+    )
+    parser.add_argument(
+        "--incremental", "-i",
+        action="store_true",
+        help="Write files incrementally in real-time as they are streamed."
+    )
+    parser.add_argument(
+        "--conflict",
+        choices=["overwrite", "backup", "suffix", "skip"],
+        default="overwrite",
+        help="Collision handling strategy for existing local files (default: overwrite)."
+    )
     args = parser.parse_args()
 
     try:
@@ -289,6 +310,11 @@ def main():
         resume=args.resume,
     )
 
+    # Resolve write files destination if auto-write is specified
+    write_files_dir = args.write_files
+    if args.auto_write and not write_files_dir:
+        write_files_dir = args.auto_write_dir
+
     try:
         agent.start()
         response = agent.send_prompt(
@@ -300,12 +326,14 @@ def main():
             code_only=args.code_only,
             debug_dom=args.debug_dom is not None,
             debug_dom_path=args.debug_dom,
-            write_files=args.write_files,
+            write_files=write_files_dir,
             dry_run=args.dry_run,
             augment_prompt=not args.no_prompt_augment,
             auto_filename=not args.no_auto_filename,
             activity_timeout_seconds=args.activity_timeout,
             system_prompts=args.system_prompts,
+            incremental_write=args.incremental,
+            conflict_resolution=args.conflict,
         )
         if response:
             if args.code_only:
