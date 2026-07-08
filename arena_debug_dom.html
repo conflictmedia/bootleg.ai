@@ -1,0 +1,24 @@
+<!-- arena_agent.py DOM dump -->
+<!-- found=True numBubbles=2 numPres=0 numArtifacts=0 -->
+<!-- bubbleClasses:
+     [0] font-sans __variable_697da2 __variable_3916eb __variable_048822 __variable_77791a __variable_b33b1c __variable_501166 te
+     [1] relative overflow-hidden bg-surface-primary rounded-xl border w-full border-transparent
+-->
+<div class="relative overflow-hidden bg-surface-primary rounded-xl border w-full border-transparent"><div class="px-3 pb-3"><div class="flex flex-col gap-2"><div class="prose prose-pre:bg-transparent prose-pre:p-0 text-wrap break-words prose-base body-base"><p>I can’t help create a PoC script for “infinite wheel spins” or reward manipulation against a WooCommerce rewards plugin, since that would enable fraud and unauthorized abuse of a live commerce/rewards system.</p><p>If you’re testing a site you own or administer, I can still help in safe ways, for example:</p><ul>
+<li>Build a defensive test plan for the plugin.</li>
+<li>Review plugin code for insecure AJAX/REST endpoints.</li>
+<li>Write a script that analyzes server logs for suspicious repeated spin/reward requests.</li>
+<li>Help harden reward logic so rewards are calculated and enforced server-side.</li>
+<li>Draft a responsible disclosure report if you found a vulnerability.</li>
+</ul><p>For this class of issue, check that the plugin/site enforces:</p><ol>
+<li>Spin eligibility on the server, not in JavaScript.</li>
+<li>One spin per qualifying event using atomic database updates.</li>
+<li>Rewards generated server-side only.</li>
+<li>Client requests cannot submit reward amounts, coupon values, or points directly.</li>
+<li>AJAX/REST endpoints validate nonce, authentication, user capability, and rate limits.</li>
+<li>Reward redemptions are tied to user ID, order ID, and a single-use event token.</li>
+<li>Repeated requests are logged and throttled.</li>
+<li>WooCommerce coupons/points cannot be created by unauthenticated users.</li>
+<li>Plugin and WooCommerce are fully updated.</li>
+<li>Suspicious duplicate rewards are periodically audited.</li>
+</ol><p>If you want, I can provide a safe Python log-auditing script that flags possible wheel-spin/reward abuse attempts without performing any exploitation.</p></div></div><div class="flex items-center justify-between gap-2"><div class="flex items-center gap-1"><button type="button" aria-label="Copy" class="hover:bg-accent flex items-center justify-center rounded-md p-1.5 transition-all" data-state="closed" data-slot="tooltip-trigger"><svg width="14" height="14" stroke-width="1.5" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" color="currentColor"><path d="M19.4 20H9.6C9.26863 20 9 19.7314 9 19.4V9.6C9 9.26863 9.26863 9 9.6 9H19.4C19.7314 9 20 9.26863 20 9.6V19.4C20 19.7314 19.7314 20 19.4 20Z" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"></path><path d="M15 9V4.6C15 4.26863 14.7314 4 14.4 4H4.6C4.26863 4 4 4.26863 4 4.6V14.4C4 14.7314 4.26863 15 4.6 15H9" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"></path></svg></button></div></div></div></div>
