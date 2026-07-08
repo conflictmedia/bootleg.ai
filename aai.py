@@ -17,6 +17,10 @@ Usage:
     python arena_agent.py --site arena --prompt "Refactor function foo" --write-files ./out
     python arena_agent.py --site arena --prompt "Now add unit tests" --resume
 
+    # Download the Agent Mode Workspace (one-click ZIP, with fallbacks):
+    python arena_agent.py --site arena --agent-mode --prompt "Build a snake game" --workspace-files ./out
+    python arena_agent.py --site arena --resume --workspace-files ./out   # download-only
+
 Notes:
     - Close the regular Chrome/Chromium browser before running, otherwise the
       profile lock will cause this script to fail.
@@ -38,6 +42,7 @@ import os
 import re
 import sys
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -67,11 +72,13 @@ SITES = {
         "name": "Arena",
         "url": "https://arena.ai",
         "chat_path": "/chat",
+        "agent_path": "/agent",
     },
     "canary": {
         "name": "Canary Arena",
         "url": "https://canaryarena.ai",
         "chat_path": "/chat",
+        "agent_path": "/agent",
     },
 }
 
@@ -209,7 +216,27 @@ class ArenaAgent:
         # analytics / WebSocket / SSE connections open and networkidle can hang
         # for 30s+ or fire spuriously. The subsequent element waits catch
         # anything we actually need.
-        full_url = f"{self.site['url']}{self.chat_path}"
+        # Decide where to navigate.
+        # When --agent-mode is requested and we are NOT resuming a specific
+        # chat, navigate directly to the site's /agent path. This loads Arena
+        # straight into Agent Mode (arena.ai/agent / canaryarena.ai/agent)
+        # instead of landing on /chat and driving the mode-switch dropdown.
+        # The _in_agent_mode() check below still falls back to the dropdown if
+        # /agent doesn't actually enter Agent Mode, so this is safe.
+        if self.resume:
+            # --resume already set self.chat_path to the saved conversation URL.
+            nav_path = self.chat_path
+        elif self.agent_mode:
+            nav_path = self.site.get("agent_path") or "/agent"
+            print(
+                "[info] --agent-mode: navigating directly to the agent "
+                "URL instead of using the mode-switch dropdown.",
+                file=sys.stderr,
+            )
+        else:
+            nav_path = self.chat_path
+
+        full_url = f"{self.site['url']}{nav_path}"
         print(f"[info] Navigating to {full_url}", file=sys.stderr)
         self.page.goto(full_url, wait_until="domcontentloaded")
 
@@ -1479,6 +1506,250 @@ class ArenaAgent:
                     return stripped.join("\n");
                 };
 
+                // Workspace state probe. Returns {present, fileCount, files,
+                // writing, signature}.
+                //
+                // Arena Agent Mode renders a "Workspace" panel (right side)
+                // listing every file the agent created. The completion loop
+                // uses this to avoid finalizing while files are still being
+                // generated: `signature` changes whenever a file appears or a
+                // file's rendered status changes (e.g. the "Write X.py 181
+                // lines" tool-call status, whose line count grows as the file
+                // is written). `writing` is true when a workspace spinner /
+                // progress indicator is visible.
+                //
+                // We deliberately derive `signature` from things that CHANGE
+                // during generation (not the persistent verb labels, which
+                // remain after completion and would block finalize forever).
+                window.__arena_workspace_state = function() {
+                    const state = { present: false, fileCount: 0, files: [], writing: false, signature: '' };
+
+                    // --- Locate file entries via per-file Download buttons ---
+                    const dlBtns = Array.from(document.querySelectorAll(
+                        'button[aria-label="Download file"], button[aria-label*="download file" i]'
+                    )).filter(b => b.offsetParent !== null);
+
+                    // Whole-workspace download button (broad marker that a
+                    // Workspace panel exists even when no per-file buttons do).
+                    const dlAll = Array.from(document.querySelectorAll(
+                        'button[aria-label*="download" i]:not([aria-label*="file" i])'
+                    )).filter(b => b.offsetParent !== null);
+
+                    const wsMarker = document.querySelector(
+                        '[data-testid*="workspace" i], [class*="workspace" i]'
+                    );
+
+                    state.present = dlBtns.length > 0 || dlAll.length > 0 || !!wsMarker;
+                    state.fileCount = dlBtns.length;
+
+                    // --- Collect filenames near each download button ---
+                    const names = [];
+                    for (const btn of dlBtns) {
+                        let row = btn;
+                        for (let i = 0; i < 6 && row; i++) {
+                            const trunc = row.querySelector && row.querySelector(
+                                '.truncate, [data-slot="tooltip-trigger"], span[class*="file" i]'
+                            );
+                            if (trunc) {
+                                const t = (trunc.textContent || '').trim();
+                                if (t && t !== 'Download' && /\./.test(t)) { names.push(t); break; }
+                            }
+                            row = row.parentElement;
+                        }
+                    }
+                    state.files = names;
+
+                    // --- Detect active writing (spinners / progress only) ---
+                    const wsRoot = wsMarker || document.body;
+                    if (wsRoot) {
+                        const spins = wsRoot.querySelectorAll(
+                            'svg[class*="animate-spin" i], [class*="progress" i], [role="progressbar" i]'
+                        );
+                        for (const s of spins) {
+                            if (s.offsetParent !== null) { state.writing = true; break; }
+                        }
+                    }
+
+                    // --- Signature: changes as files appear or statuses change ---
+                    // Include the last assistant bubble's tool-call (.not-prose)
+                    // status text -- e.g. "Write matrix.py 181 lines". The line
+                    // count grows as the file is written, so the signature
+                    // changes during generation and stabilizes when done.
+                    const bubbles = window.__arena_get_assistant_bubbles();
+                    const last = bubbles.length ? bubbles[bubbles.length - 1] : null;
+                    let toolText = '';
+                    if (last) {
+                        const toolBlocks = last.querySelectorAll('.not-prose, [class*="tool" i]');
+                        for (const tb of toolBlocks) {
+                            if (tb.offsetParent === null) continue;
+                            toolText += ' ' + (tb.innerText || '').replace(/\\s+/g, ' ').trim();
+                        }
+                    }
+                    // Last 240 chars of tool status catches the most recent
+                    // (often actively-changing) line; filenames catch new files.
+                    // Include fileCount too so a new file is ALWAYS detected
+                    // even if filename collection misses (e.g. unfamiliar DOM).
+                    state.signature = 'n=' + names.length + '|f=' + state.fileCount
+                        + '|' + names.slice().sort().join(',')
+                        + '#' + toolText.slice(-240);
+
+                    return state;
+                };
+
+                // WHOLE-DOCUMENT file-block scanner. __arena_get_code_blocks()
+                // only scans the LAST chat bubble, but the Workspace panel is a
+                // separate DOM subtree. This helper scans document.body for
+                // artifact file viewers + CodeMirror editors + labeled code
+                // blocks anywhere on the page, so the download fallback can
+                // recover files that live in the Workspace panel. Returns the
+                // same {type, filename, language, code} shape as the others.
+                //
+                // NOTE: this does NOT scroll virtualized CodeMirror editors
+                // (that's __arena_get_codemirror_blocks' async job). It only
+                // grabs what is currently rendered.
+                window.__arena_get_all_code_blocks = function() {
+                    const blocks = [];
+                    const root = document.body;
+                    if (!root) return blocks;
+
+                    // Artifact file viewers anywhere in the document.
+                    const artifactEls = root.querySelectorAll('[class*="group/artifact"]');
+                    for (const art of artifactEls) {
+                        if (art.parentElement &&
+                            art.parentElement.closest('[class*="group/artifact"]')) continue;
+                        let filename = '';
+                        const filenameEl = art.querySelector(
+                            '.min-w-0.flex-1.truncate, span.truncate.text-sm, .truncate.text-sm, [data-slot="tooltip-trigger"]'
+                        );
+                        if (filenameEl) filename = filenameEl.textContent.trim();
+                        let lang = '';
+                        const langEl = art.querySelector('[class*="uppercase"]');
+                        if (langEl) lang = langEl.textContent.trim();
+                        let codeEl = art.querySelector('.whitespace-pre-wrap.font-mono')
+                            || art.querySelector('.whitespace-pre-wrap')
+                            || art.querySelector('pre code, pre')
+                            || art.querySelector('code');
+                        const code = codeEl ? window.__arena_extract_clean_code(codeEl) : '';
+                        if (code && code.trim()) {
+                            blocks.push({ type: 'artifact', filename: filename, language: lang, code: code });
+                        }
+                    }
+
+                    // Non-virtualized CodeMirror editors (lines present in DOM).
+                    // Virtualized editors are handled by the async CodeMirror
+                    // extractor; this is a cheap synchronous grab for any that
+                    // aren't virtualized (e.g. small files fully rendered).
+                    const editors = root.querySelectorAll('.cm-editor');
+                    const seenEditors = new Set();
+                    for (const editor of editors) {
+                        let card = editor.parentElement;
+                        for (let i = 0; i < 10 && card; i++) {
+                            if (card.querySelector('[aria-label="Download file"]')) break;
+                            card = card.parentElement;
+                        }
+                        let filename = '';
+                        if (card) {
+                            const fnEl = card.querySelector('[data-slot="tooltip-trigger"]');
+                            if (fnEl && fnEl.textContent.trim()) filename = fnEl.textContent.trim();
+                            if (!filename) {
+                                const truncs = card.querySelectorAll('.truncate');
+                                for (const t of truncs) {
+                                    const txt = t.textContent.trim();
+                                    if (txt && txt !== 'Download' && /\./.test(txt)) { filename = txt; break; }
+                                }
+                            }
+                        }
+                        let lang = '';
+                        const cmContent = editor.querySelector('.cm-content');
+                        if (cmContent) lang = cmContent.getAttribute('data-language') || '';
+                        const scroller = editor.querySelector('.cm-scroller');
+                        if (scroller && scroller.scrollHeight > scroller.clientHeight * 1.5) {
+                            // Virtualized -- skip here; async extractor handles it.
+                            continue;
+                        }
+                        const lines = editor.querySelectorAll('.cm-line');
+                        if (!lines.length) continue;
+                        if (seenEditors.has(editor)) continue;
+                        seenEditors.add(editor);
+                        const code = Array.from(lines).map(l => l.textContent).join('\n');
+                        if (code.trim()) {
+                            blocks.push({ type: 'codemirror', filename: filename, language: lang, code: code });
+                        }
+                    }
+
+                    return blocks;
+                };
+
+                // WORKSPACE diagnostic dump. Returns a plain object describing
+                // every interactive control on the page so we can find the
+                // real download button / link when the heuristics miss. Used by
+                // download_workspace() (auto-invoked when download fails, or on
+                // demand via --workspace-debug-dom).
+                window.__arena_dump_workspace = function() {
+                    const out = {
+                        wsFound: false,
+                        wsRootCount: 0,
+                        wsHtml: '',
+                        buttons: [],
+                        downloadLinks: [],
+                        cmEditors: 0,
+                        artifacts: 0,
+                        pres: 0,
+                        perFileButtons: 0
+                    };
+
+                    const wsRoots = Array.from(document.querySelectorAll(
+                        '[data-testid*="workspace" i], [class*="workspace" i], [aria-label*="workspace" i]'
+                    )).filter(e => e.offsetParent !== null);
+                    out.wsRootCount = wsRoots.length;
+                    out.wsFound = wsRoots.length > 0;
+                    if (wsRoots.length) {
+                        out.wsHtml = (wsRoots[0].outerHTML || '').slice(0, 20000);
+                    }
+
+                    const interactive = Array.from(document.querySelectorAll(
+                        'button, a, [role="button"]'
+                    )).filter(b => b.offsetParent !== null);
+                    let emitted = 0;
+                    for (const b of interactive) {
+                        emitted++;
+                        if (emitted > 300) break;
+                        const aria = (b.getAttribute('aria-label') || '').trim();
+                        const text = (b.innerText || b.textContent || '').trim().slice(0, 60);
+                        const tag = b.tagName.toLowerCase();
+                        let cls = '';
+                        try { cls = (b.className && b.className.toString) ? b.className.toString().slice(0, 100) : ''; } catch (e) {}
+                        const box = b.getBoundingClientRect();
+                        out.buttons.push({
+                            tag: tag,
+                            aria: aria,
+                            text: text,
+                            cls: cls,
+                            href: b.getAttribute('href') || '',
+                            x: Math.round(box.x),
+                            y: Math.round(box.y),
+                            isDownload: /download/i.test(aria + ' ' + text) || b.hasAttribute('download')
+                        });
+                    }
+
+                    out.perFileButtons = document.querySelectorAll(
+                        'button[aria-label="Download file"], button[aria-label*="download file" i]'
+                    ).length;
+                    out.cmEditors = document.querySelectorAll('.cm-editor').length;
+                    out.artifacts = document.querySelectorAll('[class*="group/artifact"]').length;
+                    out.pres = document.querySelectorAll('pre').length;
+
+                    out.downloadLinks = Array.from(document.querySelectorAll('a[href]'))
+                        .filter(a => {
+                            const href = a.getAttribute('href') || '';
+                            const dl = a.getAttribute('download') || '';
+                            return /download/i.test(dl) || /\.(zip|tar|gz|tgz|py|js|ts|jsx|tsx|json|txt|html|css|md|csv|xml|yaml|yml)$/i.test(href);
+                        })
+                        .map(a => ({ href: (a.getAttribute('href')||'').slice(0,200), download: a.getAttribute('download') || '' }));
+
+                    return out;
+                };
+
                 // Combined poll -- one round-trip returns everything we need.
                 // NOTE: __arena_get_codemirror_blocks is ASYNC and expensive
                 // (scrolls the editor), so it is NOT called here. It's called
@@ -1491,7 +1762,8 @@ class ArenaAgent:
                         codeBlocks: window.__arena_get_code_blocks(),
                         numBubbles: window.__arena_get_assistant_bubbles().length,
                         sendButton: window.__arena_send_button_state(),
-                        copyButton: window.__arena_copy_button_state()
+                        copyButton: window.__arena_copy_button_state(),
+                        workspace: window.__arena_workspace_state()
                     };
                 };
             }
@@ -1630,6 +1902,7 @@ class ArenaAgent:
         system_prompts: Optional[List[str]] = None,
         incremental_write: bool = False,
         conflict_resolution: str = "overwrite",
+        workspace_wait: bool = True,
     ) -> Optional[str]:
         """Send `prompt` and return the assistant's response text.
 
@@ -1889,6 +2162,21 @@ class ArenaAgent:
         # "Copy button appeared" message on every poll.
         ever_saw_copy_button = False
 
+        # WORKSPACE TRACKING: Arena Agent Mode populates a Workspace panel
+        # (right side) with files as the task runs. The agent can finish its
+        # prose answer (and show a Copy button) WHILE it is still writing
+        # files. To avoid finalizing before all files are generated, we track
+        # the Workspace's signature and refuse to return until it has been
+        # stable for the same window as the content. `signature` changes when
+        # files appear or their rendered status (e.g. line counts) grows.
+        last_workspace_sig = ""
+        workspace_stable_count = 0
+        ever_saw_workspace_files = False
+        # Pre-initialised so the progress log (which runs before the first
+        # poll parses the Workspace state) never hits a NameError.
+        ws_file_count = 0
+        ws_writing = False
+
         # ACTIVITY TRACKING: last_activity_time is the wall-clock time of the
         # last observed change (text delta, code-block count change, or
         # generation-state transition). If now - last_activity_time exceeds
@@ -1941,6 +2229,8 @@ class ArenaAgent:
                     f"[info] Still waiting... (elapsed={elapsed:.0f}s, "
                     f"text={len(last_text)} chars, "
                     f"code_blocks={len(last_code_blocks)}, "
+                    f"workspace_files={ws_file_count}, "
+                    f"workspace_writing={ws_writing}, "
                     f"idle={idle:.1f}s, "
                     f"response_started={response_started}, "
                     f"generating={ever_saw_generating}, "
@@ -1977,6 +2267,18 @@ class ArenaAgent:
             # the model is still streaming or executing a tool call.
             copy_state = poll.get("copyButton") or {}
             copy_visible = bool(copy_state.get("found")) and bool(copy_state.get("visible"))
+
+            # Workspace state: see the WORKSPACE TRACKING comment above.
+            ws_state = poll.get("workspace") or {}
+            ws_present = bool(ws_state.get("present"))
+            try:
+                ws_file_count = int(ws_state.get("fileCount") or 0)
+            except (TypeError, ValueError):
+                ws_file_count = 0
+            ws_sig = ws_state.get("signature") or ""
+            ws_writing = bool(ws_state.get("writing"))
+            if ws_present and ws_file_count > 0:
+                ever_saw_workspace_files = True
 
             # Decide whether we are looking at the NEW response or still seeing
             # the previous turn's assistant bubble. Completion checks and
@@ -2035,6 +2337,16 @@ class ArenaAgent:
             else:
                 copy_stable_count = 0
 
+            # WORKSPACE stability: once we've seen Workspace files, require the
+            # Workspace signature to be unchanged for the stability window
+            # before we allow completion. A changing signature means files are
+            # still appearing or being written -- keep waiting.
+            if ws_sig and ws_sig == last_workspace_sig:
+                workspace_stable_count += 1
+            else:
+                workspace_stable_count = 0
+            last_workspace_sig = ws_sig
+
             # ACTIVITY TRACKING: build a signature of the current observable
             # state. If it differs from the last signature, the page is making
             # progress -- reset the activity timer.
@@ -2042,7 +2354,8 @@ class ArenaAgent:
                 f"{len(current_text)}|{current_text[:64]}|"
                 f"bubbles={num_bubbles}|code={code_signature}|"
                 f"response_started={response_started}|"
-                f"gen={is_generating}|send={send_disabled}|copy={copy_visible}"
+                f"gen={is_generating}|send={send_disabled}|copy={copy_visible}|"
+                f"ws={ws_sig}|wsW={ws_writing}"
             )
             if current_signature != last_activity_signature:
                 if last_activity_signature != "":
@@ -2080,6 +2393,26 @@ class ArenaAgent:
             # where the first text chunk lands before isGenerating flips True.
             in_min_window = elapsed < min_response_seconds
 
+            # WORKSPACE completion gate. Once the agent has created Workspace
+            # files, refuse to finalize until the Workspace signature has been
+            # stable for the same window as the content. This is THE fix for
+            # "finishes before all files are generated": the prose answer can
+            # look complete (Copy button visible) while the agent is still
+            # writing files to the Workspace, so we block on Workspace
+            # stability too. ws_writing (a visible spinner) also blocks as a
+            # strong "definitely busy" hint.
+            # --no-workspace-wait disables this gate (escape hatch in case the
+            # signature never stabilizes, e.g. a live timer in the DOM).
+            if workspace_wait:
+                workspace_busy = ever_saw_workspace_files and ws_writing
+                workspace_settled = (
+                    not ever_saw_workspace_files
+                    or workspace_stable_count >= copy_stable_needed
+                )
+            else:
+                workspace_busy = False
+                workspace_settled = True
+
             # Completion check #0 (highest priority): Copy button visible on
             # the NEW response, no active generation signal, and the response
             # content + Copy button have both been stable briefly. This avoids
@@ -2092,6 +2425,8 @@ class ArenaAgent:
                     and has_response_content
                     and not in_min_window
                     and not is_generating
+                    and not workspace_busy
+                    and workspace_settled
                     and copy_stable_count >= copy_stable_needed
                     and stable_count >= copy_stable_needed):
                 if stream:
@@ -2123,6 +2458,8 @@ class ArenaAgent:
                     and has_response_content
                     and (ever_saw_generating or response_started)
                     and not in_min_window
+                    and not workspace_busy
+                    and workspace_settled
                     and stable_count >= primary_stable_needed
                     and not is_generating):
                 if stream:
@@ -2937,6 +3274,730 @@ class ArenaAgent:
                 if success:
                     self._incremental_write_cache[safe_name] = content_len
 
+    # ------------------------------------------------------------------
+    # Workspace file download
+    # ------------------------------------------------------------------
+    #
+    # Arena's Agent Mode maintains a "Workspace" panel on the right side of
+    # the screen containing every file the agent created during its task.
+    # download_workspace() pulls those files to a local directory.
+    #
+    # Strategy (tried in order -- first success wins):
+    #   1. Click the Workspace's "download all" control -> Playwright
+    #      captures a ZIP download -> save and (optionally) extract.
+    #   2. Per-file download buttons: click each file's Download button and
+    #      capture each download individually.
+    #   3. DOM extraction fallback: read each rendered CodeMirror editor /
+    #      artifact's content from the page and write the files directly.
+
+    # CSS selectors for the Workspace panel's "download all" control.
+    _WORKSPACE_DOWNLOAD_SELECTORS = [
+        '[data-testid*="workspace" i] button[aria-label*="download" i]:visible',
+        '[class*="workspace" i] button[aria-label*="download" i]:visible',
+        'button[aria-label="Download"]:visible',
+        'button[aria-label*="Download all" i]:visible',
+        'button[aria-label*="download workspace" i]:visible',
+        'button[aria-label*="Download files" i]:visible',
+        '[class*="workspace" i] button:has-text("Download"):visible',
+        'button[aria-label*="download" i]:not([aria-label*="file" i]):visible',
+    ]
+
+    # Selectors for per-file Download buttons inside the Workspace file list.
+    _WORKSPACE_FILE_DOWNLOAD_SELECTORS = [
+        'button[aria-label="Download file"]',
+        'button[aria-label*="download file" i]',
+        '[data-testid*="file" i] button[aria-label*="download" i]',
+        'button[aria-label="Download file"]:visible',
+    ]
+
+    # Selectors used to expand the Workspace panel if it appears collapsed.
+    _WORKSPACE_TOGGLE_SELECTORS = [
+        'button:has-text("Workspace"):visible',
+        '[role="tab"]:has-text("Workspace"):visible',
+        'button[aria-label*="Workspace" i]:visible',
+        'button:has-text("Files"):visible',
+        '[role="tab"]:has-text("Files"):visible',
+    ]
+
+    def download_workspace(
+        self,
+        target_dir: str,
+        dry_run: bool = False,
+        extract_zip: bool = True,
+        keep_zip: bool = False,
+        debug_dom_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Download all files from the Workspace into ``target_dir``.
+
+        Returns a result dict::
+
+            {
+              "strategy": "zip-download" | "per-file-download" |
+                           "dom-extraction" | None,
+              "files":   [<written filenames>],
+              "zip_path": "<path to saved zip or None>",
+              "errors":  [<error messages>],
+            }
+
+        ``strategy`` is None when nothing could be downloaded.
+        """
+        target = Path(target_dir).expanduser().resolve()
+        results: Dict[str, Any] = {
+            "strategy": None,
+            "files": [],
+            "zip_path": None,
+            "errors": [],
+        }
+
+        if not dry_run:
+            target.mkdir(parents=True, exist_ok=True)
+
+        # Where to write the diagnostic dump (auto-written on failure, or
+        # always when --workspace-debug-dom is passed). Defaults to a file
+        # next to the target dir.
+        self.workspace_debug_dom_path = (
+            debug_dom_path
+            or os.environ.get("ARENA_WORKSPACE_DEBUG_DOM")
+            or str(target / "workspace_debug_dom.html")
+        )
+
+        print(
+            f"[info] --workspace-files: downloading Workspace "
+            f"to {target}",
+            file=sys.stderr,
+        )
+
+        # Make sure the Workspace panel is open before probing for controls.
+        self._ensure_workspace_visible()
+
+        # Wait for the Workspace to settle before downloading. This guards the
+        # download-only path (--resume --workspace-files, where send_prompt is
+        # not called and the completion loop never ran) and is otherwise a fast
+        # no-op: it polls the workspace signature until it stops changing.
+        self._wait_for_workspace_stable(timeout_s=120.0, stable_s=5.0)
+
+        # Strategy 1: whole-workspace ZIP download.
+        if self._workspace_download_zip(
+            target, dry_run, extract_zip, keep_zip, results
+        ):
+            results["strategy"] = "zip-download"
+            return results
+
+        # Strategy 2: click each per-file download button.
+        if self._workspace_download_per_file(target, dry_run, results):
+            results["strategy"] = "per-file-download"
+            return results
+
+        # Strategy 3: read file contents from the rendered DOM.
+        if self._workspace_extract_from_dom(target, dry_run, results):
+            results["strategy"] = "dom-extraction"
+            return results
+
+        # All strategies failed. Dump the Workspace DOM so the failure is
+        # diagnosable: the report lists every button/link on the page so the
+        # real download control can be located and wired up.
+        dump_path = self._workspace_dump_dom(self.workspace_debug_dom_path)
+        print(
+            "[warn] --workspace-files: could not download any Workspace "
+            "files.",
+            file=sys.stderr,
+        )
+        if dump_path:
+            print(
+                f"[warn] Wrote a Workspace diagnostic dump to: {dump_path}\n"
+                "[warn] Re-run with --headed to watch the Workspace panel "
+                "live, or set ARENA_WORKSPACE_DOWNLOAD_SELECTOR to the "
+                "exact CSS selector of the download control (visible in "
+                "the dump under 'download-ish buttons').",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "[warn] Set ARENA_WORKSPACE_DOWNLOAD_SELECTOR to the exact "
+                "CSS selector of the download button.",
+                file=sys.stderr,
+            )
+        return results
+
+    def _workspace_download_zip(
+        self,
+        target: Path,
+        dry_run: bool,
+        extract_zip: bool,
+        keep_zip: bool,
+        results: Dict[str, Any],
+    ) -> bool:
+        """Click the Workspace download button and capture the ZIP.
+
+        Returns True if a ZIP was successfully downloaded (and optionally
+        extracted), False otherwise.
+        """
+        btn = self._find_workspace_download_button()
+        if btn is None:
+            # Heuristic fallback: enumerate every visible button/link whose
+            # label mentions "download" and try each. This catches download
+            # controls whose aria-label we didn't anticipate.
+            print(
+                "[info] No 'download all' button matched the known "
+                "selectors; enumerating download-ish controls...",
+                file=sys.stderr,
+            )
+            btn = self._find_download_control_by_heuristic(exclude_per_file=True)
+        if btn is None:
+            print(
+                "[info] No Workspace 'download all' button found; "
+                "trying per-file downloads.",
+                file=sys.stderr,
+            )
+            return False
+
+        if dry_run:
+            print(
+                f"[info] [dry-run] would click the Workspace download "
+                f"button and save the ZIP to {target}",
+                file=sys.stderr,
+            )
+            results["files"] = ["<workspace.zip (dry-run)>"]
+            return True
+
+        try:
+            with self.page.expect_download(timeout=20_000) as dl_info:
+                btn.click()
+            download = dl_info.value
+        except PlaywrightTimeout:
+            print(
+                "[warn] Clicking the Workspace download button did not "
+                "trigger a download (timed out after 20s). It may open a "
+                "menu instead, or be behind a paywall / disabled.",
+                file=sys.stderr,
+            )
+            results["errors"].append("zip-download-timeout")
+            return False
+        except Exception as exc:
+            print(f"[warn] Workspace ZIP download failed: {exc}", file=sys.stderr)
+            results["errors"].append(f"zip-download-failed: {exc}")
+            return False
+
+        suggested = download.suggested_filename or "workspace.zip"
+        if not suggested.lower().endswith(".zip"):
+            suggested += ".zip"
+        zip_path = target / self._sanitize_filename(suggested)
+        # Avoid clobbering an existing zip from a previous run.
+        if zip_path.exists():
+            zip_path = target / f"workspace_{int(time.time())}.zip"
+
+        try:
+            download.save_as(str(zip_path))
+        except Exception as exc:
+            print(f"[warn] Failed to save the Workspace ZIP: {exc}", file=sys.stderr)
+            results["errors"].append(f"zip-save-failed: {exc}")
+            return False
+
+        results["zip_path"] = str(zip_path)
+        print(f"[info] Saved Workspace ZIP: {zip_path}", file=sys.stderr)
+
+        extracted: List[str] = []
+        if extract_zip:
+            extracted = self._safe_extract_zip(zip_path, target)
+            print(
+                f"[info] Extracted {len(extracted)} file(s) from the ZIP "
+                f"into {target}",
+                file=sys.stderr,
+            )
+            results["files"] = extracted
+
+        # Keep the zip around only if requested AND we extracted (otherwise
+        # the zip IS the deliverable).
+        if extract_zip and not keep_zip:
+            try:
+                zip_path.unlink()
+                print(
+                    "[info] Removed the ZIP after extraction (use "
+                    "--workspace-keep-zip to keep it).",
+                    file=sys.stderr,
+                )
+            except OSError:
+                pass
+        else:
+            if not results["files"]:
+                results["files"] = [zip_path.name]
+
+        return True
+
+    def _workspace_download_per_file(
+        self,
+        target: Path,
+        dry_run: bool,
+        results: Dict[str, Any],
+    ) -> bool:
+        """Click each per-file Download button and capture each file.
+
+        Returns True if at least one file was downloaded.
+        """
+        buttons = self._collect_visible_buttons(self._WORKSPACE_FILE_DOWNLOAD_SELECTORS)
+        if not buttons:
+            print(
+                "[info] No per-file download buttons found in the "
+                "Workspace; falling back to DOM extraction.",
+                file=sys.stderr,
+            )
+            return False
+
+        print(
+            f"[info] Found {len(buttons)} per-file download button(s) "
+            f"in the Workspace.",
+            file=sys.stderr,
+        )
+
+        saved: List[str] = []
+        for idx, btn in enumerate(buttons, 1):
+            if dry_run:
+                print(
+                    f"[info] [dry-run] would download workspace file "
+                    f"[{idx}/{len(buttons)}]",
+                    file=sys.stderr,
+                )
+                saved.append(f"<workspace_file_{idx} (dry-run)>")
+                continue
+            try:
+                with self.page.expect_download(timeout=15_000) as dl_info:
+                    btn.click()
+                download = dl_info.value
+                fname = download.suggested_filename or f"workspace_file_{idx}"
+                safe = self._sanitize_filename(fname) or f"workspace_file_{idx}"
+                out_path = target / safe
+                if out_path.exists():
+                    out_path = target / f"{out_path.stem}_{idx}{out_path.suffix}"
+                download.save_as(str(out_path))
+                saved.append(out_path.name)
+                print(
+                    f"[info] Downloaded workspace file "
+                    f"[{idx}/{len(buttons)}]: {out_path.name}",
+                    file=sys.stderr,
+                )
+            except PlaywrightTimeout:
+                print(
+                    f"[warn] Workspace file [{idx}/{len(buttons)}] "
+                    f"download did not trigger (timed out).",
+                    file=sys.stderr,
+                )
+                results["errors"].append(f"per-file-timeout-{idx}")
+            except Exception as exc:
+                print(
+                    f"[warn] Workspace file [{idx}/{len(buttons)}] "
+                    f"download failed: {exc}",
+                    file=sys.stderr,
+                )
+                results["errors"].append(f"per-file-failed-{idx}: {exc}")
+
+        results["files"] = saved
+        return bool(saved)
+
+    def _workspace_extract_from_dom(
+        self,
+        target: Path,
+        dry_run: bool,
+        results: Dict[str, Any],
+    ) -> int:
+        """Read file contents from the page DOM and write them.
+
+        Reuses the existing CodeMirror + artifact extraction helpers.
+        Returns the number of files written.
+        """
+        print(
+            "[info] Extracting Workspace files from the rendered DOM "
+            "(no download button / ZIP available).",
+            file=sys.stderr,
+        )
+
+        blocks: List[Dict[str, Any]] = []
+
+        def _as_blocks(val) -> List[Dict[str, Any]]:
+            """Coerce an evaluate() result into a list of block dicts.
+
+            Guards against malformed page responses: a dict, string, or None
+            must never be passed to list.extend() (which would iterate a
+            dict's keys and corrupt the block list).
+            """
+            if isinstance(val, list):
+                return [b for b in val if isinstance(b, dict)]
+            return []
+
+        # 1. WHOLE-DOCUMENT scan: artifact cards + rendered CodeMirror editors
+        #    anywhere on the page (including the Workspace panel, which is a
+        #    separate DOM subtree from the chat bubble).
+        try:
+            all_blocks = self.page.evaluate(
+                "() => window.__arena_get_all_code_blocks && window.__arena_get_all_code_blocks()"
+            )
+            all_blocks = _as_blocks(all_blocks)
+            if all_blocks:
+                print(
+                    f"[info] Whole-document scan found {len(all_blocks)} "
+                    f"file block(s).",
+                    file=sys.stderr,
+                )
+            blocks.extend(all_blocks)
+        except Exception as exc:
+            print(f"[debug] DOM extraction (all-code-blocks) failed: {exc}", file=sys.stderr)
+
+        # 2. Virtualized CodeMirror editors (async -- scrolls to collect lines).
+        try:
+            cm_blocks = self.page.evaluate(
+                "async () => { return await window.__arena_get_codemirror_blocks(); }"
+            )
+            cm_blocks = _as_blocks(cm_blocks)
+            if cm_blocks:
+                print(
+                    f"[info] CodeMirror scan found {len(cm_blocks)} "
+                    f"file block(s).",
+                    file=sys.stderr,
+                )
+            blocks.extend(cm_blocks)
+        except Exception as exc:
+            print(f"[debug] DOM extraction (CodeMirror) failed: {exc}", file=sys.stderr)
+
+        # 3. Bubble-scoped code blocks (inline <pre>, data-code-blocks in the
+        #    last assistant message) -- cheap, and catches code that isn't in
+        #    an artifact/CodeMirror.
+        try:
+            poll = self.page.evaluate("() => window.__arena_poll()") or {}
+            blocks.extend(_as_blocks(poll.get("codeBlocks")))
+        except Exception as exc:
+            print(f"[debug] DOM extraction (poll) failed: {exc}", file=sys.stderr)
+
+        if not blocks:
+            print(
+                "[warn] DOM extraction found 0 renderable code blocks. "
+                "The agent may not have created any files, or the "
+                "Workspace is empty.",
+                file=sys.stderr,
+            )
+            return 0
+
+        assigned = self._assign_filenames(blocks, auto_filename=True)
+        write_results = self._write_code_files(
+            assigned, target_dir=str(target), dry_run=dry_run
+        )
+        written = [
+            Path(p).name
+            for p, status in write_results.items()
+            if status in ("written", "skipped_dry_run")
+        ]
+        results["files"] = written
+        return len(written)
+
+    def _find_workspace_download_button(self):
+        """Return the first visible Workspace download button, or None."""
+        override = os.environ.get("ARENA_WORKSPACE_DOWNLOAD_SELECTOR")
+        selectors = [override] if override else self._WORKSPACE_DOWNLOAD_SELECTORS
+        for selector in selectors:
+            loc = self._wait_visible(selector, timeout_ms=800)
+            if loc is not None:
+                print(
+                    f"[info] Found Workspace download control: {selector}",
+                    file=sys.stderr,
+                )
+                return loc
+        return None
+
+    def _find_download_control_by_heuristic(self, exclude_per_file: bool = True):
+        """Locate a download control by enumerating labelled buttons/links.
+
+        Asks the page for every visible button/anchor, returns the first
+        whose aria-label or text mentions "download" (case-insensitive),
+        optionally excluding per-file "Download file" buttons. Used as a
+        fallback when the fixed selector list misses Arena's actual DOM.
+        """
+        try:
+            controls = self.page.evaluate(
+                """
+                (excludePerFile) => {
+                    const out = [];
+                    const els = Array.from(document.querySelectorAll(
+                        'button, a, [role="button"]'
+                    )).filter(b => b.offsetParent !== null);
+                    for (const b of els) {
+                        const aria = (b.getAttribute('aria-label') || '').trim();
+                        const text = (b.innerText || b.textContent || '').trim();
+                        if (!/download/i.test(aria + ' ' + text)) continue;
+                        if (excludePerFile && /download file/i.test(aria + ' ' + text)) continue;
+                        out.push({ aria: aria, text: text.slice(0, 40) });
+                    }
+                    return out;
+                }
+                """,
+                exclude_per_file,
+            ) or []
+        except Exception as exc:
+            print(f"[debug] download-control heuristic enumerate failed: {exc}", file=sys.stderr)
+            return None
+
+        if not controls:
+            return None
+        print(
+            f"[info] Heuristic found {len(controls)} download-ish control(s): "
+            + ", ".join(f"{c['aria'] or c['text']!r}" for c in controls[:5]),
+            file=sys.stderr,
+        )
+        for c in controls:
+            label = c.get("aria") or c.get("text") or ""
+            if not label:
+                continue
+            safe = label.replace('"', '\\"')
+            for sel in (
+                f'button[aria-label="{safe}" i]',
+                f'a[aria-label="{safe}" i]',
+                f'[aria-label="{safe}" i]',
+                f'button:has-text("{safe}")',
+            ):
+                loc = self._wait_visible(sel, timeout_ms=400)
+                if loc is not None:
+                    print(f"[info] Using heuristic download control: {sel}", file=sys.stderr)
+                    return loc
+        return None
+
+    def _workspace_dump_dom(self, path: Optional[str]) -> Optional[str]:
+        """Write a Workspace diagnostic report and log a summary.
+
+        The report is an HTML file containing the Workspace panel's markup
+        plus a JSON description of every button/link on the page (with
+        aria-labels, text, classes, coordinates, and a download flag). This
+        is the key tool for finding the real download selector when the
+        heuristics miss. Returns the written path, or None on failure.
+        """
+        try:
+            info = self.page.evaluate(
+                "() => window.__arena_dump_workspace && window.__arena_dump_workspace()"
+            ) or {}
+        except Exception as exc:
+            print(f"[warn] workspace dump failed: {exc}", file=sys.stderr)
+            return None
+        if not isinstance(info, dict):
+            return None
+
+        ws_found = bool(info.get("wsFound"))
+        cm = int(info.get("cmEditors") or 0)
+        arts = int(info.get("artifacts") or 0)
+        pres = int(info.get("pres") or 0)
+        per_file = int(info.get("perFileButtons") or 0)
+        buttons = info.get("buttons") or []
+        dl_links = info.get("downloadLinks") or []
+        downloadish = [b for b in buttons if b.get("isDownload")]
+
+        print(
+            f"[info] Workspace dump: wsFound={ws_found} "
+            f"cmEditors={cm} artifacts={arts} pre={pres} "
+            f"perFileButtons={per_file} totalButtons={len(buttons)} "
+            f"downloadLinks={len(dl_links)} downloadishButtons={len(downloadish)}",
+            file=sys.stderr,
+        )
+        if downloadish:
+            print("[info] Download-ish controls on the page:", file=sys.stderr)
+            for b in downloadish[:12]:
+                print(
+                    f"        <{b.get('tag')}> aria={b.get('aria')!r} "
+                    f"text={b.get('text')!r} at ({b.get('x')},{b.get('y')}) "
+                    f"href={b.get('href')!r}",
+                    file=sys.stderr,
+                )
+
+        if not path:
+            path = "workspace_debug_dom.html"
+        try:
+            import json as _json
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("<!-- workspace diagnostic dump -->\n")
+                f.write(
+                    f"<!-- wsFound={ws_found} cmEditors={cm} artifacts={arts} "
+                    f"pre={pres} perFileButtons={per_file} "
+                    f"downloadish={len(downloadish)} -->\n"
+                )
+                f.write("<details open><summary>Workspace panel HTML</summary>\n")
+                f.write("<pre>")
+                f.write((info.get("wsHtml") or "<no workspace element matched>").replace("<", "&lt;"))
+                f.write("</pre></details>\n")
+                f.write("<details><summary>Buttons/links (JSON)</summary>\n")
+                f.write("<pre>")
+                f.write(_json.dumps(buttons, indent=2).replace("<", "&lt;"))
+                f.write("</pre></details>\n")
+                f.write("<details><summary>Download links (JSON)</summary>\n")
+                f.write("<pre>")
+                f.write(_json.dumps(dl_links, indent=2).replace("<", "&lt;"))
+                f.write("</pre></details>\n")
+        except OSError as exc:
+            print(f"[warn] could not write workspace dump: {exc}", file=sys.stderr)
+            return None
+        return path
+
+    def _wait_for_workspace_stable(
+        self, timeout_s: float = 120.0, stable_s: float = 5.0
+    ) -> bool:
+        """Poll the Workspace signature until it stops changing.
+
+        Returns True if the Workspace settled (or was never present), False if
+        the timeout elapsed while it kept changing. Uses the same
+        ``__arena_workspace_state`` helper the completion loop relies on, so
+        files still appearing / being written keep resetting the timer.
+        """
+        try:
+            state = self.page.evaluate(
+                "() => window.__arena_workspace_state && window.__arena_workspace_state()"
+            ) or {}
+        except Exception:
+            state = {}
+        present = bool(state.get("present"))
+        if not present:
+            # No Workspace panel -- nothing to wait for.
+            return True
+
+        interval = 0.5
+        needed = max(2, int(stable_s / interval))
+        stable = 0
+        last_sig = state.get("signature") or ""
+        start = time.time()
+        last_file_count = -1
+
+        while time.time() - start < timeout_s:
+            try:
+                state = self.page.evaluate(
+                    "() => window.__arena_workspace_state()"
+                ) or {}
+            except Exception:
+                state = {}
+            sig = state.get("signature") or ""
+            try:
+                fc = int(state.get("fileCount") or 0)
+            except (TypeError, ValueError):
+                fc = 0
+            writing = bool(state.get("writing"))
+
+            if fc != last_file_count:
+                print(
+                    f"[info] Workspace has {fc} file(s); waiting for "
+                    f"files to finish generating...",
+                    file=sys.stderr,
+                )
+                last_file_count = fc
+
+            if sig == last_sig and not writing:
+                stable += 1
+            else:
+                stable = 0
+            last_sig = sig
+
+            if stable >= needed:
+                print(
+                    f"[info] Workspace settled ({fc} file(s), stable for "
+                    f"{stable * interval:.1f}s). Proceeding to download.",
+                    file=sys.stderr,
+                )
+                return True
+            time.sleep(interval)
+
+        print(
+            f"[warn] Workspace did not settle within {timeout_s}s "
+            f"(last {last_file_count} file(s)); downloading anyway.",
+            file=sys.stderr,
+        )
+        return False
+
+    def _collect_visible_buttons(self, selector_list: List[str]) -> List:
+        """Collect visible buttons matching any selector in ``selector_list``.
+
+        De-duplicates by screen position so the same button matched by
+        multiple selectors isn't clicked twice.
+        """
+        seen_positions = set()
+        collected: List = []
+        for selector in selector_list:
+            try:
+                locs = self.page.locator(selector)
+                count = locs.count()
+            except Exception:
+                count = 0
+            for i in range(count):
+                btn = locs.nth(i)
+                try:
+                    if not btn.is_visible():
+                        continue
+                except Exception:
+                    continue
+                try:
+                    box = btn.bounding_box()
+                    key = (
+                        (round(box["x"], 1), round(box["y"], 1))
+                        if box else f"no-box-{id(btn)}"
+                    )
+                except Exception:
+                    key = f"no-box-{id(btn)}"
+                if key in seen_positions:
+                    continue
+                seen_positions.add(key)
+                collected.append(btn)
+            if collected:
+                # If we found buttons with the first matching selector,
+                # prefer that set over re-matching later (broader) ones.
+                break
+        return collected
+
+    def _ensure_workspace_visible(self):
+        """Best-effort: expand the Workspace panel if it is collapsed.
+
+        Clicks a "Workspace" / "Files" tab or toggle if one is present.
+        Errors are swallowed -- this is purely opportunistic.
+        """
+        for selector in self._WORKSPACE_TOGGLE_SELECTORS:
+            loc = self._wait_visible(selector, timeout_ms=400)
+            if loc is not None:
+                try:
+                    loc.click()
+                    time.sleep(0.3)
+                    print(
+                        f"[info] Opened Workspace panel via: {selector}",
+                        file=sys.stderr,
+                    )
+                except Exception:
+                    pass
+                return
+
+    def _safe_extract_zip(
+        self, zip_path: Path, dest_dir: Path
+    ) -> List[str]:
+        """Extract ``zip_path`` into ``dest_dir`` guarding against zip-slip.
+
+        Returns the basenames of the files extracted. Directory entries and
+        unsafe (path-traversal) members are skipped.
+        """
+        dest = Path(dest_dir).resolve()
+        extracted: List[str] = []
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                for member in zf.infolist():
+                    if member.is_dir():
+                        continue
+                    name = member.filename
+                    target = (dest / name).resolve()
+                    try:
+                        target.relative_to(dest)
+                    except ValueError:
+                        print(
+                            f"[warn] Skipping unsafe zip member: {name}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    zf.extract(member, dest)
+                    # Report the member's relative path (e.g.
+                    # "project/main.py") so the results list reflects the
+                    # on-disk layout exactly.
+                    extracted.append(name)
+        except (zipfile.BadZipFile, OSError) as exc:
+            print(
+                f"[warn] Failed to extract ZIP {zip_path}: {exc}",
+                file=sys.stderr,
+            )
+        return extracted
+
     def _dump_dom(self, path: Optional[str]) -> Optional[str]:
         """Dump diagnostic info about the last assistant bubble to a file.
 
@@ -3232,8 +4293,12 @@ def main():
     )
     parser.add_argument(
         "--prompt",
-        required=True,
-        help="The prompt to send to Agent Mode.",
+        default=None,
+        help=(
+            "The prompt to send to Agent Mode. Optional ONLY when "
+            "--workspace-files is used (download-only mode); otherwise "
+            "required."
+        ),
     )
     parser.add_argument(
         "--system-prompt",
@@ -3283,7 +4348,12 @@ def main():
     parser.add_argument(
         "--agent-mode",
         action="store_true",
-        help="Attempt to switch from Battle Mode to Agent Mode before sending the prompt.",
+        help=(
+            "Navigate directly to the site's /agent URL (arena.ai/agent or "
+            "canaryarena.ai/agent) to enter Agent Mode, instead of landing on "
+            "/chat and switching via the mode dropdown. Falls back to the "
+            "dropdown if /agent does not enter Agent Mode."
+        ),
     )
     parser.add_argument(
         "--direct-mode",
@@ -3480,16 +4550,85 @@ def main():
         default="overwrite",
         help="Collision handling strategy for existing local files (default: overwrite)."
     )
+    # ------------------------------------------------------------------
+    # Workspace file download
+    # ------------------------------------------------------------------
+    parser.add_argument(
+        "--workspace-files",
+        "--workspace",
+        "-w",
+        metavar="DIR",
+        default=None,
+        help=(
+            "Download all files from Arena's Agent Mode Workspace panel to "
+            "the given directory (created if missing). Tries a one-click ZIP "
+            "download first, then per-file download buttons, then DOM "
+            "extraction. Run AFTER the response completes (or use it alone, "
+            "with --resume, to fetch the files of an existing chat)."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-keep-zip",
+        action="store_true",
+        help=(
+            "With --workspace-files: keep the downloaded workspace ZIP after "
+            "extracting it (default: the ZIP is deleted once extracted)."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-no-extract",
+        action="store_true",
+        help=(
+            "With --workspace-files: save the workspace ZIP but do NOT "
+            "extract it (the zip itself is the deliverable)."
+        ),
+    )
+    parser.add_argument(
+        "--no-workspace-wait",
+        action="store_true",
+        help=(
+            "Do NOT hold the response open until the Workspace stops "
+            "changing. By default the agent waits for Workspace files to "
+            "finish generating before finalizing (prevents cutting off "
+            "mid-file). Use this escape hatch only if the Workspace "
+            "signature never stabilizes and the run hangs."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-debug-dom",
+        metavar="PATH",
+        nargs="?",
+        const="workspace_debug_dom.html",
+        default=None,
+        help=(
+            "With --workspace-files: write a Workspace diagnostic report "
+            "(panel HTML + every button/link on the page with its "
+            "aria-label/text/coords) to PATH. Always written on failure; "
+            "pass this to also write it on success. The default path if "
+            "PATH is omitted is workspace_debug_dom.html."
+        ),
+    )
     args = parser.parse_args()
 
-    try:
-        prompt = _append_included_files_to_prompt(
-            args.prompt,
-            args.include_files,
-            max_chars_per_file=args.include_file_max_chars,
+    # --prompt is required unless we're in download-only mode.
+    if not args.prompt and not args.workspace_files:
+        parser.error(
+            "--prompt is required (or pass --workspace-files to download "
+            "the Workspace without sending a new prompt)."
         )
-    except Exception as exc:
-        parser.error(str(exc))
+
+    # Build the effective prompt. Skipped entirely in download-only mode
+    # (--workspace-files without --prompt), where there's nothing to send.
+    prompt = None
+    if args.prompt or args.include_files:
+        try:
+            prompt = _append_included_files_to_prompt(
+                args.prompt or "",
+                args.include_files,
+                max_chars_per_file=args.include_file_max_chars,
+            )
+        except Exception as exc:
+            parser.error(str(exc))
 
     # Resolve write files destination if auto-write is specified
     write_files_dir = args.write_files
@@ -3511,52 +4650,70 @@ def main():
 
     try:
         agent.start()
-        response = agent.send_prompt(
-            prompt,
-            max_wait_seconds=args.timeout,
-            stream=args.stream,
-            stable_seconds=args.stable_seconds,
-            wait_seconds=args.wait_seconds,
-            code_only=args.code_only,
-            debug_dom=args.debug_dom is not None,
-            debug_dom_path=args.debug_dom,
-            write_files=write_files_dir,
-            dry_run=args.dry_run,
-            augment_prompt=not args.no_prompt_augment,
-            auto_filename=not args.no_auto_filename,
-            activity_timeout_seconds=args.activity_timeout,
+        if args.prompt:
+            response = agent.send_prompt(
+                prompt,
+                max_wait_seconds=args.timeout,
+                stream=args.stream,
+                stable_seconds=args.stable_seconds,
+                wait_seconds=args.wait_seconds,
+                code_only=args.code_only,
+                debug_dom=args.debug_dom is not None,
+                debug_dom_path=args.debug_dom,
+                write_files=write_files_dir,
+                dry_run=args.dry_run,
+                augment_prompt=not args.no_prompt_augment,
+                auto_filename=not args.no_auto_filename,
+                activity_timeout_seconds=args.activity_timeout,
             system_prompts=args.system_prompts,
             incremental_write=args.incremental,
             conflict_resolution=args.conflict,
+            workspace_wait=not args.no_workspace_wait,
         )
-        if response:
-            if args.code_only:
-                # Code blocks already include their own formatting.
-                print(response)
-            elif not args.stream:
-                print("\n" + "=" * 60)
-                print("RESPONSE")
-                print("=" * 60)
-                print(response)
-                print("=" * 60)
-            # Persist the chat URL so a subsequent --resume can find this
-            # conversation. We do this AFTER printing the response so the
-            # user sees output first, and only on a non-empty response so
-            # a failed run doesn't overwrite a previously-good state file.
-            # _save_state() is defensive: it logs a warning and returns
-            # False on failure rather than raising, so a state-save
-            # hiccup never masks a successful run.
-            agent._save_state()
-        else:
-            if args.code_only:
-                print("[warn] No code blocks found in the response.", file=sys.stderr)
+            if response:
+                if args.code_only:
+                    # Code blocks already include their own formatting.
+                    print(response)
+                elif not args.stream:
+                    print("\n" + "=" * 60)
+                    print("RESPONSE")
+                    print("=" * 60)
+                    print(response)
+                    print("=" * 60)
+                # Persist the chat URL so a subsequent --resume can find this
+                # conversation. We do this AFTER printing the response so the
+                # user sees output first, and only on a non-empty response so
+                # a failed run doesn't overwrite a previously-good state file.
+                # _save_state() is defensive: it logs a warning and returns
+                # False on failure rather than raising, so a state-save
+                # hiccup never masks a successful run.
+                agent._save_state()
             else:
-                print("[warn] No response text found.", file=sys.stderr)
-            # Even on an empty response, the page URL may have changed
-            # (e.g. Arena created the chat but the model returned nothing).
-            # Try to save state so a retry --resume can find the same
-            # conversation -- but only if we actually have a non-/chat URL.
-            agent._save_state()
+                if args.code_only:
+                    print("[warn] No code blocks found in the response.", file=sys.stderr)
+                else:
+                    print("[warn] No response text found.", file=sys.stderr)
+                # Even on an empty response, the page URL may have changed
+                # (e.g. Arena created the chat but the model returned nothing).
+                # Try to save state so a retry --resume can find the same
+                # conversation -- but only if we actually have a non-/chat URL.
+                agent._save_state()
+
+        # Download Workspace files. Runs whether or not a prompt was sent,
+        # so it also works in download-only mode (--resume --workspace-files).
+        if args.workspace_files:
+            ws_result = agent.download_workspace(
+                args.workspace_files,
+                dry_run=args.dry_run,
+                extract_zip=not args.workspace_no_extract,
+                keep_zip=args.workspace_keep_zip,
+                debug_dom_path=args.workspace_debug_dom,
+            )
+            # If --workspace-debug-dom was passed, force a dump even on success
+            # (download_workspace already dumps on failure).
+            if args.workspace_debug_dom and ws_result.get("strategy"):
+                agent._workspace_dump_dom(args.workspace_debug_dom)
+
         if args.screenshot:
             agent.save_debug_screenshot()
     except Exception as exc:

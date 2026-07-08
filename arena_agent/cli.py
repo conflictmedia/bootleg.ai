@@ -38,8 +38,12 @@ def main():
     )
     parser.add_argument(
         "--prompt",
-        required=True,
-        help="The prompt to send to Agent Mode.",
+        default=None,
+        help=(
+            "The prompt to send to Agent Mode. Optional ONLY when "
+            "--workspace-files is used (download-only mode); otherwise "
+            "required."
+        ),
     )
     parser.add_argument(
         "--system-prompt",
@@ -89,7 +93,12 @@ def main():
     parser.add_argument(
         "--agent-mode",
         action="store_true",
-        help="Attempt to switch from Battle Mode to Agent Mode before sending the prompt.",
+        help=(
+            "Navigate directly to the site's /agent URL (arena.ai/agent or "
+            "canaryarena.ai/agent) to enter Agent Mode, instead of landing on "
+            "/chat and switching via the mode dropdown. Falls back to the "
+            "dropdown if /agent does not enter Agent Mode."
+        ),
     )
     parser.add_argument(
         "--direct-mode",
@@ -286,16 +295,85 @@ def main():
         default="overwrite",
         help="Collision handling strategy for existing local files (default: overwrite)."
     )
+    # ------------------------------------------------------------------
+    # Workspace file download
+    # ------------------------------------------------------------------
+    parser.add_argument(
+        "--workspace-files",
+        "--workspace",
+        "-w",
+        metavar="DIR",
+        default=None,
+        help=(
+            "Download all files from Arena's Agent Mode Workspace panel to "
+            "the given directory (created if missing). Tries a one-click ZIP "
+            "download first, then per-file download buttons, then DOM "
+            "extraction. Run AFTER the response completes (or use it alone, "
+            "with --resume, to fetch the files of an existing chat)."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-keep-zip",
+        action="store_true",
+        help=(
+            "With --workspace-files: keep the downloaded workspace ZIP after "
+            "extracting it (default: the ZIP is deleted once extracted)."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-no-extract",
+        action="store_true",
+        help=(
+            "With --workspace-files: save the workspace ZIP but do NOT "
+            "extract it (the zip itself is the deliverable)."
+        ),
+    )
+    parser.add_argument(
+        "--no-workspace-wait",
+        action="store_true",
+        help=(
+            "Do NOT hold the response open until the Workspace stops "
+            "changing. By default the agent waits for Workspace files to "
+            "finish generating before finalizing (prevents cutting off "
+            "mid-file). Use this escape hatch only if the Workspace "
+            "signature never stabilizes and the run hangs."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-debug-dom",
+        metavar="PATH",
+        nargs="?",
+        const="workspace_debug_dom.html",
+        default=None,
+        help=(
+            "With --workspace-files: write a Workspace diagnostic report "
+            "(panel HTML + every button/link on the page with its "
+            "aria-label/text/coords) to PATH. Always written on failure; "
+            "pass this to also write it on success. The default path if "
+            "PATH is omitted is workspace_debug_dom.html."
+        ),
+    )
     args = parser.parse_args()
 
-    try:
-        prompt = _append_included_files_to_prompt(
-            args.prompt,
-            args.include_files,
-            max_chars_per_file=args.include_file_max_chars,
+    # --prompt is required unless we're in download-only mode.
+    if not args.prompt and not args.workspace_files:
+        parser.error(
+            "--prompt is required (or pass --workspace-files to download "
+            "the Workspace without sending a new prompt)."
         )
-    except Exception as exc:
-        parser.error(str(exc))
+
+    # Build the effective prompt. Skipped entirely in download-only mode
+    # (--workspace-files without --prompt), where there's nothing to send.
+    prompt = None
+    if args.prompt or args.include_files:
+        try:
+            prompt = _append_included_files_to_prompt(
+                args.prompt or "",
+                args.include_files,
+                max_chars_per_file=args.include_file_max_chars,
+            )
+        except Exception as exc:
+            parser.error(str(exc))
 
     agent = ArenaAgent(
         site_key=args.site,
@@ -317,52 +395,70 @@ def main():
 
     try:
         agent.start()
-        response = agent.send_prompt(
-            prompt,
-            max_wait_seconds=args.timeout,
-            stream=args.stream,
-            stable_seconds=args.stable_seconds,
-            wait_seconds=args.wait_seconds,
-            code_only=args.code_only,
-            debug_dom=args.debug_dom is not None,
-            debug_dom_path=args.debug_dom,
-            write_files=write_files_dir,
-            dry_run=args.dry_run,
-            augment_prompt=not args.no_prompt_augment,
-            auto_filename=not args.no_auto_filename,
-            activity_timeout_seconds=args.activity_timeout,
+        if args.prompt:
+            response = agent.send_prompt(
+                prompt,
+                max_wait_seconds=args.timeout,
+                stream=args.stream,
+                stable_seconds=args.stable_seconds,
+                wait_seconds=args.wait_seconds,
+                code_only=args.code_only,
+                debug_dom=args.debug_dom is not None,
+                debug_dom_path=args.debug_dom,
+                write_files=write_files_dir,
+                dry_run=args.dry_run,
+                augment_prompt=not args.no_prompt_augment,
+                auto_filename=not args.no_auto_filename,
+                activity_timeout_seconds=args.activity_timeout,
             system_prompts=args.system_prompts,
             incremental_write=args.incremental,
             conflict_resolution=args.conflict,
+            workspace_wait=not args.no_workspace_wait,
         )
-        if response:
-            if args.code_only:
-                # Code blocks already include their own formatting.
-                print(response)
-            elif not args.stream:
-                print("\n" + "=" * 60)
-                print("RESPONSE")
-                print("=" * 60)
-                print(response)
-                print("=" * 60)
-            # Persist the chat URL so a subsequent --resume can find this
-            # conversation. We do this AFTER printing the response so the
-            # user sees output first, and only on a non-empty response so
-            # a failed run doesn't overwrite a previously-good state file.
-            # _save_state() is defensive: it logs a warning and returns
-            # False on failure rather than raising, so a state-save
-            # hiccup never masks a successful run.
-            agent._save_state()
-        else:
-            if args.code_only:
-                print("[warn] No code blocks found in the response.", file=sys.stderr)
+            if response:
+                if args.code_only:
+                    # Code blocks already include their own formatting.
+                    print(response)
+                elif not args.stream:
+                    print("\n" + "=" * 60)
+                    print("RESPONSE")
+                    print("=" * 60)
+                    print(response)
+                    print("=" * 60)
+                # Persist the chat URL so a subsequent --resume can find this
+                # conversation. We do this AFTER printing the response so the
+                # user sees output first, and only on a non-empty response so
+                # a failed run doesn't overwrite a previously-good state file.
+                # _save_state() is defensive: it logs a warning and returns
+                # False on failure rather than raising, so a state-save
+                # hiccup never masks a successful run.
+                agent._save_state()
             else:
-                print("[warn] No response text found.", file=sys.stderr)
-            # Even on an empty response, the page URL may have changed
-            # (e.g. Arena created the chat but the model returned nothing).
-            # Try to save state so a retry --resume can find the same
-            # conversation -- but only if we actually have a non-/chat URL.
-            agent._save_state()
+                if args.code_only:
+                    print("[warn] No code blocks found in the response.", file=sys.stderr)
+                else:
+                    print("[warn] No response text found.", file=sys.stderr)
+                # Even on an empty response, the page URL may have changed
+                # (e.g. Arena created the chat but the model returned nothing).
+                # Try to save state so a retry --resume can find the same
+                # conversation -- but only if we actually have a non-/chat URL.
+                agent._save_state()
+
+        # Download Workspace files. Runs whether or not a prompt was sent,
+        # so it also works in download-only mode (--resume --workspace-files).
+        if args.workspace_files:
+            ws_result = agent.download_workspace(
+                args.workspace_files,
+                dry_run=args.dry_run,
+                extract_zip=not args.workspace_no_extract,
+                keep_zip=args.workspace_keep_zip,
+                debug_dom_path=args.workspace_debug_dom,
+            )
+            # If --workspace-debug-dom was passed, force a dump even on success
+            # (download_workspace already dumps on failure).
+            if args.workspace_debug_dom and ws_result.get("strategy"):
+                agent._workspace_dump_dom(args.workspace_debug_dom)
+
         if args.screenshot:
             agent.save_debug_screenshot()
     except Exception as exc:

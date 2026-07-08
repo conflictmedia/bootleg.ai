@@ -710,6 +710,252 @@ class JSHelpersMixin:
                     return stripped.join("\n");
                 };
 
+                // Workspace state probe. Returns {present, fileCount, files,
+                // writing, signature}.
+                //
+                // Arena Agent Mode renders a "Workspace" panel (right side)
+                // listing every file the agent created. The completion loop
+                // uses this to avoid finalizing while files are still being
+                // generated: `signature` changes whenever a file appears or a
+                // file's rendered status changes (e.g. the "Write X.py 181
+                // lines" tool-call status, whose line count grows as the file
+                // is written). `writing` is true when a workspace spinner /
+                // progress indicator is visible.
+                //
+                // We deliberately derive `signature` from things that CHANGE
+                // during generation (not the persistent verb labels, which
+                // remain after completion and would block finalize forever).
+                window.__arena_workspace_state = function() {
+                    const state = { present: false, fileCount: 0, files: [], writing: false, signature: '' };
+
+                    // --- Locate file entries via per-file Download buttons ---
+                    const dlBtns = Array.from(document.querySelectorAll(
+                        'button[aria-label="Download file"], button[aria-label*="download file" i]'
+                    )).filter(b => b.offsetParent !== null);
+
+                    // Whole-workspace download button (broad marker that a
+                    // Workspace panel exists even when no per-file buttons do).
+                    const dlAll = Array.from(document.querySelectorAll(
+                        'button[aria-label*="download" i]:not([aria-label*="file" i])'
+                    )).filter(b => b.offsetParent !== null);
+
+                    const wsMarker = document.querySelector(
+                        '[data-testid*="workspace" i], [class*="workspace" i]'
+                    );
+
+                    state.present = dlBtns.length > 0 || dlAll.length > 0 || !!wsMarker;
+                    state.fileCount = dlBtns.length;
+
+                    // --- Collect filenames near each download button ---
+                    const names = [];
+                    for (const btn of dlBtns) {
+                        let row = btn;
+                        for (let i = 0; i < 6 && row; i++) {
+                            const trunc = row.querySelector && row.querySelector(
+                                '.truncate, [data-slot="tooltip-trigger"], span[class*="file" i]'
+                            );
+                            if (trunc) {
+                                const t = (trunc.textContent || '').trim();
+                                if (t && t !== 'Download' && /\./.test(t)) { names.push(t); break; }
+                            }
+                            row = row.parentElement;
+                        }
+                    }
+                    state.files = names;
+
+                    // --- Detect active writing (spinners / progress only) ---
+                    const wsRoot = wsMarker || document.body;
+                    if (wsRoot) {
+                        const spins = wsRoot.querySelectorAll(
+                            'svg[class*="animate-spin" i], [class*="progress" i], [role="progressbar" i]'
+                        );
+                        for (const s of spins) {
+                            if (s.offsetParent !== null) { state.writing = true; break; }
+                        }
+                    }
+
+                    // --- Signature: changes as files appear or statuses change ---
+                    // Include the last assistant bubble's tool-call (.not-prose)
+                    // status text -- e.g. "Write matrix.py 181 lines". The line
+                    // count grows as the file is written, so the signature
+                    // changes during generation and stabilizes when done.
+                    const bubbles = window.__arena_get_assistant_bubbles();
+                    const last = bubbles.length ? bubbles[bubbles.length - 1] : null;
+                    let toolText = '';
+                    if (last) {
+                        const toolBlocks = last.querySelectorAll('.not-prose, [class*="tool" i]');
+                        for (const tb of toolBlocks) {
+                            if (tb.offsetParent === null) continue;
+                            toolText += ' ' + (tb.innerText || '').replace(/\\s+/g, ' ').trim();
+                        }
+                    }
+                    // Last 240 chars of tool status catches the most recent
+                    // (often actively-changing) line; filenames catch new files.
+                    // Include fileCount too so a new file is ALWAYS detected
+                    // even if filename collection misses (e.g. unfamiliar DOM).
+                    state.signature = 'n=' + names.length + '|f=' + state.fileCount
+                        + '|' + names.slice().sort().join(',')
+                        + '#' + toolText.slice(-240);
+
+                    return state;
+                };
+
+                // WHOLE-DOCUMENT file-block scanner. __arena_get_code_blocks()
+                // only scans the LAST chat bubble, but the Workspace panel is a
+                // separate DOM subtree. This helper scans document.body for
+                // artifact file viewers + CodeMirror editors + labeled code
+                // blocks anywhere on the page, so the download fallback can
+                // recover files that live in the Workspace panel. Returns the
+                // same {type, filename, language, code} shape as the others.
+                //
+                // NOTE: this does NOT scroll virtualized CodeMirror editors
+                // (that's __arena_get_codemirror_blocks' async job). It only
+                // grabs what is currently rendered.
+                window.__arena_get_all_code_blocks = function() {
+                    const blocks = [];
+                    const root = document.body;
+                    if (!root) return blocks;
+
+                    // Artifact file viewers anywhere in the document.
+                    const artifactEls = root.querySelectorAll('[class*="group/artifact"]');
+                    for (const art of artifactEls) {
+                        if (art.parentElement &&
+                            art.parentElement.closest('[class*="group/artifact"]')) continue;
+                        let filename = '';
+                        const filenameEl = art.querySelector(
+                            '.min-w-0.flex-1.truncate, span.truncate.text-sm, .truncate.text-sm, [data-slot="tooltip-trigger"]'
+                        );
+                        if (filenameEl) filename = filenameEl.textContent.trim();
+                        let lang = '';
+                        const langEl = art.querySelector('[class*="uppercase"]');
+                        if (langEl) lang = langEl.textContent.trim();
+                        let codeEl = art.querySelector('.whitespace-pre-wrap.font-mono')
+                            || art.querySelector('.whitespace-pre-wrap')
+                            || art.querySelector('pre code, pre')
+                            || art.querySelector('code');
+                        const code = codeEl ? window.__arena_extract_clean_code(codeEl) : '';
+                        if (code && code.trim()) {
+                            blocks.push({ type: 'artifact', filename: filename, language: lang, code: code });
+                        }
+                    }
+
+                    // Non-virtualized CodeMirror editors (lines present in DOM).
+                    // Virtualized editors are handled by the async CodeMirror
+                    // extractor; this is a cheap synchronous grab for any that
+                    // aren't virtualized (e.g. small files fully rendered).
+                    const editors = root.querySelectorAll('.cm-editor');
+                    const seenEditors = new Set();
+                    for (const editor of editors) {
+                        // Walk up to the card to find a filename.
+                        let card = editor.parentElement;
+                        for (let i = 0; i < 10 && card; i++) {
+                            if (card.querySelector('[aria-label="Download file"]')) break;
+                            card = card.parentElement;
+                        }
+                        let filename = '';
+                        if (card) {
+                            const fnEl = card.querySelector('[data-slot="tooltip-trigger"]');
+                            if (fnEl && fnEl.textContent.trim()) filename = fnEl.textContent.trim();
+                            if (!filename) {
+                                const truncs = card.querySelectorAll('.truncate');
+                                for (const t of truncs) {
+                                    const txt = t.textContent.trim();
+                                    if (txt && txt !== 'Download' && /\./.test(txt)) { filename = txt; break; }
+                                }
+                            }
+                        }
+                        let lang = '';
+                        const cmContent = editor.querySelector('.cm-content');
+                        if (cmContent) lang = cmContent.getAttribute('data-language') || '';
+                        const scroller = editor.querySelector('.cm-scroller');
+                        if (scroller && scroller.scrollHeight > scroller.clientHeight * 1.5) {
+                            // Virtualized -- skip here; async extractor handles it.
+                            continue;
+                        }
+                        const lines = editor.querySelectorAll('.cm-line');
+                        if (!lines.length) continue;
+                        if (seenEditors.has(editor)) continue;
+                        seenEditors.add(editor);
+                        const code = Array.from(lines).map(l => l.textContent).join('\n');
+                        if (code.trim()) {
+                            blocks.push({ type: 'codemirror', filename: filename, language: lang, code: code });
+                        }
+                    }
+
+                    return blocks;
+                };
+
+                // WORKSPACE diagnostic dump. Returns a plain object describing
+                // every interactive control on the page so we can find the
+                // real download button / link when the heuristics miss. Used by
+                // _workspace_dump_dom() (auto-invoked when download fails, or
+                // on demand via --workspace-debug-dom).
+                window.__arena_dump_workspace = function() {
+                    const out = {
+                        wsFound: false,
+                        wsRootCount: 0,
+                        wsHtml: '',
+                        buttons: [],
+                        downloadLinks: [],
+                        cmEditors: 0,
+                        artifacts: 0,
+                        pres: 0,
+                        perFileButtons: 0
+                    };
+
+                    const wsRoots = Array.from(document.querySelectorAll(
+                        '[data-testid*="workspace" i], [class*="workspace" i], [aria-label*="workspace" i]'
+                    )).filter(e => e.offsetParent !== null);
+                    out.wsRootCount = wsRoots.length;
+                    out.wsFound = wsRoots.length > 0;
+                    if (wsRoots.length) {
+                        // Smallest-ish root is usually the panel itself.
+                        out.wsHtml = (wsRoots[0].outerHTML || '').slice(0, 20000);
+                    }
+
+                    const interactive = Array.from(document.querySelectorAll(
+                        'button, a, [role="button"]'
+                    )).filter(b => b.offsetParent !== null);
+                    let emitted = 0;
+                    for (const b of interactive) {
+                        emitted++;
+                        if (emitted > 300) break;
+                        const aria = (b.getAttribute('aria-label') || '').trim();
+                        const text = (b.innerText || b.textContent || '').trim().slice(0, 60);
+                        const tag = b.tagName.toLowerCase();
+                        let cls = '';
+                        try { cls = (b.className && b.className.toString) ? b.className.toString().slice(0, 100) : ''; } catch (e) {}
+                        const box = b.getBoundingClientRect();
+                        out.buttons.push({
+                            tag: tag,
+                            aria: aria,
+                            text: text,
+                            cls: cls,
+                            href: b.getAttribute('href') || '',
+                            x: Math.round(box.x),
+                            y: Math.round(box.y),
+                            isDownload: /download/i.test(aria + ' ' + text) || b.hasAttribute('download')
+                        });
+                    }
+
+                    out.perFileButtons = document.querySelectorAll(
+                        'button[aria-label="Download file"], button[aria-label*="download file" i]'
+                    ).length;
+                    out.cmEditors = document.querySelectorAll('.cm-editor').length;
+                    out.artifacts = document.querySelectorAll('[class*="group/artifact"]').length;
+                    out.pres = document.querySelectorAll('pre').length;
+
+                    out.downloadLinks = Array.from(document.querySelectorAll('a[href]'))
+                        .filter(a => {
+                            const href = a.getAttribute('href') || '';
+                            const dl = a.getAttribute('download') || '';
+                            return /download/i.test(dl) || /\.(zip|tar|gz|tgz|py|js|ts|jsx|tsx|json|txt|html|css|md|csv|xml|yaml|yml)$/i.test(href);
+                        })
+                        .map(a => ({ href: (a.getAttribute('href')||'').slice(0,200), download: a.getAttribute('download') || '' }));
+
+                    return out;
+                };
+
                 // Combined poll -- one round-trip returns everything we need.
                 // NOTE: __arena_get_codemirror_blocks is ASYNC and expensive
                 // (scrolls the editor), so it is NOT called here. It's called
@@ -722,7 +968,8 @@ class JSHelpersMixin:
                         codeBlocks: window.__arena_get_code_blocks(),
                         numBubbles: window.__arena_get_assistant_bubbles().length,
                         sendButton: window.__arena_send_button_state(),
-                        copyButton: window.__arena_copy_button_state()
+                        copyButton: window.__arena_copy_button_state(),
+                        workspace: window.__arena_workspace_state()
                     };
                 };
             }

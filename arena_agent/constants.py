@@ -20,11 +20,13 @@ SITES = {
         "name": "Arena",
         "url": "https://arena.ai",
         "chat_path": "/chat",
+        "agent_path": "/agent",
     },
     "canary": {
         "name": "Canary Arena",
         "url": "https://canaryarena.ai",
         "chat_path": "/chat",
+        "agent_path": "/agent",
     },
 }
 

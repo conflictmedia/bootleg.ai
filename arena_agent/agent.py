@@ -38,6 +38,7 @@ from .selectors import SelectorsMixin
 from .filenames import FilenameMixin
 from .code_extraction import CodeExtractionMixin
 from .state import StateMixin
+from .workspace import WorkspaceMixin
 
 # Force line-buffered stdout so --stream is truly live, even when piped.
 try:
@@ -54,10 +55,11 @@ class ArenaAgent(
     FilenameMixin,
     CodeExtractionMixin,
     StateMixin,
+    WorkspaceMixin,
 ):
     """Drive Arena.ai / CanaryArena.ai in Agent Mode via Playwright.
 
-    Composed of seven single-concern mixins; this class itself only owns:
+    Composed of eight single-concern mixins; this class itself only owns:
       - configuration (__init__)
       - browser/page lifecycle (start / close)
       - chat-entry coordination (_wait_visible, _enter_chat_if_needed)
@@ -182,7 +184,27 @@ class ArenaAgent(
         # analytics / WebSocket / SSE connections open and networkidle can hang
         # for 30s+ or fire spuriously. The subsequent element waits catch
         # anything we actually need.
-        full_url = f"{self.site['url']}{self.chat_path}"
+        # Decide where to navigate.
+        # When --agent-mode is requested and we are NOT resuming a specific
+        # chat, navigate directly to the site's /agent path. This loads Arena
+        # straight into Agent Mode (arena.ai/agent / canaryarena.ai/agent)
+        # instead of landing on /chat and driving the mode-switch dropdown.
+        # The _in_agent_mode() check below still falls back to the dropdown if
+        # /agent doesn't actually enter Agent Mode, so this is safe.
+        if self.resume:
+            # --resume already set self.chat_path to the saved conversation URL.
+            nav_path = self.chat_path
+        elif self.agent_mode:
+            nav_path = self.site.get("agent_path") or "/agent"
+            print(
+                "[info] --agent-mode: navigating directly to the agent "
+                "URL instead of using the mode-switch dropdown.",
+                file=sys.stderr,
+            )
+        else:
+            nav_path = self.chat_path
+
+        full_url = f"{self.site['url']}{nav_path}"
         print(f"[info] Navigating to {full_url}", file=sys.stderr)
         self.page.goto(full_url, wait_until="domcontentloaded")
 
@@ -366,6 +388,7 @@ class ArenaAgent(
         system_prompts: Optional[List[str]] = None,
         incremental_write: bool = False,
         conflict_resolution: str = "overwrite",
+        workspace_wait: bool = True,
     ) -> Optional[str]:
         """Send `prompt` and return the assistant's response text.
 
@@ -625,6 +648,21 @@ class ArenaAgent(
         # "Copy button appeared" message on every poll.
         ever_saw_copy_button = False
 
+        # WORKSPACE TRACKING: Arena Agent Mode populates a Workspace panel
+        # (right side) with files as the task runs. The agent can finish its
+        # prose answer (and show a Copy button) WHILE it is still writing
+        # files. To avoid finalizing before all files are generated, we track
+        # the Workspace's signature and refuse to return until it has been
+        # stable for the same window as the content. `signature` changes when
+        # files appear or their rendered status (e.g. line counts) grows.
+        last_workspace_sig = ""
+        workspace_stable_count = 0
+        ever_saw_workspace_files = False
+        # Pre-initialised so the progress log (which runs before the first
+        # poll parses the Workspace state) never hits a NameError.
+        ws_file_count = 0
+        ws_writing = False
+
         # ACTIVITY TRACKING: last_activity_time is the wall-clock time of the
         # last observed change (text delta, code-block count change, or
         # generation-state transition). If now - last_activity_time exceeds
@@ -677,6 +715,8 @@ class ArenaAgent(
                     f"[info] Still waiting... (elapsed={elapsed:.0f}s, "
                     f"text={len(last_text)} chars, "
                     f"code_blocks={len(last_code_blocks)}, "
+                    f"workspace_files={ws_file_count}, "
+                    f"workspace_writing={ws_writing}, "
                     f"idle={idle:.1f}s, "
                     f"response_started={response_started}, "
                     f"generating={ever_saw_generating}, "
@@ -713,6 +753,18 @@ class ArenaAgent(
             # the model is still streaming or executing a tool call.
             copy_state = poll.get("copyButton") or {}
             copy_visible = bool(copy_state.get("found")) and bool(copy_state.get("visible"))
+
+            # Workspace state: see the WORKSPACE TRACKING comment above.
+            ws_state = poll.get("workspace") or {}
+            ws_present = bool(ws_state.get("present"))
+            try:
+                ws_file_count = int(ws_state.get("fileCount") or 0)
+            except (TypeError, ValueError):
+                ws_file_count = 0
+            ws_sig = ws_state.get("signature") or ""
+            ws_writing = bool(ws_state.get("writing"))
+            if ws_present and ws_file_count > 0:
+                ever_saw_workspace_files = True
 
             # Decide whether we are looking at the NEW response or still seeing
             # the previous turn's assistant bubble. Completion checks and
@@ -771,6 +823,16 @@ class ArenaAgent(
             else:
                 copy_stable_count = 0
 
+            # WORKSPACE stability: once we've seen Workspace files, require the
+            # Workspace signature to be unchanged for the stability window
+            # before we allow completion. A changing signature means files are
+            # still appearing or being written -- keep waiting.
+            if ws_sig and ws_sig == last_workspace_sig:
+                workspace_stable_count += 1
+            else:
+                workspace_stable_count = 0
+            last_workspace_sig = ws_sig
+
             # ACTIVITY TRACKING: build a signature of the current observable
             # state. If it differs from the last signature, the page is making
             # progress -- reset the activity timer.
@@ -778,7 +840,8 @@ class ArenaAgent(
                 f"{len(current_text)}|{current_text[:64]}|"
                 f"bubbles={num_bubbles}|code={code_signature}|"
                 f"response_started={response_started}|"
-                f"gen={is_generating}|send={send_disabled}|copy={copy_visible}"
+                f"gen={is_generating}|send={send_disabled}|copy={copy_visible}|"
+                f"ws={ws_sig}|wsW={ws_writing}"
             )
             if current_signature != last_activity_signature:
                 if last_activity_signature != "":
@@ -816,6 +879,26 @@ class ArenaAgent(
             # where the first text chunk lands before isGenerating flips True.
             in_min_window = elapsed < min_response_seconds
 
+            # WORKSPACE completion gate. Once the agent has created Workspace
+            # files, refuse to finalize until the Workspace signature has been
+            # stable for the same window as the content. This is THE fix for
+            # "finishes before all files are generated": the prose answer can
+            # look complete (Copy button visible) while the agent is still
+            # writing files to the Workspace, so we block on Workspace
+            # stability too. ws_writing (a visible spinner) also blocks as a
+            # strong "definitely busy" hint.
+            # --no-workspace-wait disables this gate (escape hatch in case the
+            # signature never stabilizes, e.g. a live timer in the DOM).
+            if workspace_wait:
+                workspace_busy = ever_saw_workspace_files and ws_writing
+                workspace_settled = (
+                    not ever_saw_workspace_files
+                    or workspace_stable_count >= copy_stable_needed
+                )
+            else:
+                workspace_busy = False
+                workspace_settled = True
+
             # Completion check #0 (highest priority): Copy button visible on
             # the NEW response, no active generation signal, and the response
             # content + Copy button have both been stable briefly. This avoids
@@ -828,6 +911,8 @@ class ArenaAgent(
                     and has_response_content
                     and not in_min_window
                     and not is_generating
+                    and not workspace_busy
+                    and workspace_settled
                     and copy_stable_count >= copy_stable_needed
                     and stable_count >= copy_stable_needed):
                 if stream:
@@ -859,6 +944,8 @@ class ArenaAgent(
                     and has_response_content
                     and (ever_saw_generating or response_started)
                     and not in_min_window
+                    and not workspace_busy
+                    and workspace_settled
                     and stable_count >= primary_stable_needed
                     and not is_generating):
                 if stream:
